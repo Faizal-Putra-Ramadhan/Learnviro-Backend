@@ -40,6 +40,34 @@ def health_check():
     return {"status": "ok", "message": "Server is running"}
 
 import json
+import base64
+
+import requests
+from fastapi import Request
+from starlette.concurrency import run_in_threadpool
+
+@app.post("/predict")
+async def predict_endpoint(request: Request):
+    try:
+        image_bytes = await request.body()
+        image_bytes = rotate_image_bytes(image_bytes)
+        
+        detection_result = detect_emotion(image_bytes)
+        emosi = detection_result.get("emosi", "unknown")
+        confidence = detection_result.get("confidence", 0.0)
+        
+        if detection_result.get("error"):
+            return [{"label": "Error", "score": 0.0, "error": detection_result.get("error")}]
+        
+        # Kembalikan gambar ber-landmark (base64) supaya bisa disimpan learnviro-tk
+        annotated_b64 = ""
+        if detection_result.get("image_bytes"):
+            annotated_b64 = base64.b64encode(detection_result["image_bytes"]).decode("utf-8")
+            
+        return [{"label": emosi, "score": confidence, "annotated_image": annotated_b64}]
+    except Exception as e:
+        print(f"Error in /predict: {e}")
+        return [{"label": "Error", "score": 0.0, "error": str(e)}]
 
 @app.post("/capture")
 async def capture_image(
@@ -49,87 +77,29 @@ async def capture_image(
     mode: str = Form(...)
 ):
     try:
-        # Check Attendance State
-        state_file = os.path.join(os.path.dirname(__file__), "..", "backend_ci4", "writable", f"attendance_state_{device_id}.json")
-        state = {"is_active": False}
-        if os.path.exists(state_file):
-            with open(state_file, 'r') as f:
-                try:
-                    state = json.load(f)
-                except:
-                    pass
+        # 1. Forward the image directly to learnviro-tk
+        # learnviro-tk will then call our /predict endpoint above!
+        url = "http://localhost/learnviro-tk/emotions/classify"
         
-        if not state.get("is_active"):
-            raise HTTPException(status_code=403, detail="Absensi belum dimulai")
-            
-        current_nama = state.get("current_student", "Unknown")
-        current_mode = state.get("mode", mode)
-        # Read image bytes
         image_bytes = await image.read()
-        image_bytes = rotate_image_bytes(image_bytes) 
+        files = {'image': (image.filename, image_bytes, image.content_type)}
+        data = {'device_id': device_id, 'timestamp': timestamp, 'mode': mode}
         
-        # 1. Detect emotion
-        detection_result = detect_emotion(image_bytes)
-        emosi = detection_result.get("emosi", "unknown")
-        confidence = detection_result.get("confidence", 0.0)
+        # Jalankan panggilan blocking di threadpool supaya event loop tetap bebas
+        # melayani /predict yang dipanggil balik oleh learnviro-tk (hindari deadlock).
+        response = await run_in_threadpool(requests.post, url, data=data, files=files)
         
-        if detection_result.get("error"):
-            print(f"Detection warning: {detection_result.get('error')}")
-
-        # Ambil gambar yang sudah ditambahkan landmark dan teks
-        annotated_image_bytes = detection_result.get("image_bytes", image_bytes)
-
-        # 2. Upload to Supabase Storage (menggantikan Google Drive)
+        if response.status_code >= 400:
+            print(f"learnviro-tk returned error: {response.text}")
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+            
         try:
-            dt = datetime.fromtimestamp(int(timestamp))
-        except ValueError:
-            dt = datetime.now() # Fallback
+            return response.json()
+        except:
+            return {"status": "success", "message": response.text}
             
-        file_name = f"{device_id}_{dt.strftime('%Y%m%d_%H%M%S')}_{emosi}.jpg"
-        
-        gambar_url = upload_image_to_storage(annotated_image_bytes, file_name)
-        if not gambar_url:
-            gambar_url = "" # Fallback if upload fails
-
-        # 3. Insert into Supabase
-        # Prepare ISO format time
-        iso_time = datetime.now(timezone.utc).isoformat()
-        
-        db_result = insert_emotion_record(
-            device_id=device_id,
-            emosi=emosi,
-            confidence=confidence,
-            mode=current_mode,
-            gambar_url=gambar_url,
-            waktu=iso_time,
-            nama=current_nama
-        )
-        
-        if db_result.get("error"):
-            raise HTTPException(status_code=500, detail=f"Database error: {db_result.get('error')}")
-
-        # Auto-advance student index
-        state['current_index'] = state.get('current_index', 0) + 1
-        if state['current_index'] >= len(state.get('student_list', [])):
-            state['is_active'] = False
-            state['current_student'] = None
-        else:
-            state['current_student'] = state['student_list'][state['current_index']]
-            
-        with open(state_file, 'w') as f:
-            json.dump(state, f)
-
-        return {
-            "status": "success",
-            "emosi": emosi,
-            "confidence": confidence,
-            "gambar_url": gambar_url,
-            "waktu": iso_time,
-            "nama": current_nama
-        }
-
     except Exception as e:
-        print(f"Error in /capture: {e}")
+        print(f"Error in /capture forwarding: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
